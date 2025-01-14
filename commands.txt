@@ -1,0 +1,6 @@
+docker run -d -p 5010:5010 flask-apis
+cde574b76ced5536fc85d419c5f52a5b8292d18ddf5bf4d7efa2ee58f2cfdd9f
+
+kubectl create cronjob cronjob.yaml --image=flask-apis --schedule="*/5 * * * *"  --dry-run=client
+
+kubectl create configmap health-check-config --from-literal=interval=5

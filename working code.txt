@@ -1,0 +1,138 @@
+from flask import Flask, request, jsonify
+from kubernetes import client, config
+import re
+
+app = Flask(__name__)
+
+# Load the Kubernetes configuration
+config.load_kube_config()
+
+def sanitize_app_name(app_name):
+    # Convert to lowercase
+    app_name = app_name.lower()
+    # Replace spaces and underscores with hyphens
+    app_name = re.sub(r'[\s_]+', '-', app_name)
+    # Remove any characters that are not alphanumeric or hyphens
+    app_name = re.sub(r'[^a-z0-9-]', '', app_name)
+    return app_name
+
+@app.route('/addapplication', methods=['POST'])
+def add_application():
+    data = request.json
+
+    app_name = sanitize_app_name(data.get('AppName'))
+    replicas = data.get('Replicas')
+    image_address = data.get('ImageAddress')
+    image_tag = data.get('ImageTag')
+    domain_address = data.get('DomainAddress')
+    service_port = data.get('ServicePort')
+    resources = data.get('Resources')
+    envs = data.get('Envs', [])
+    secrets = data.get('Secrets', {})
+    external_access = data.get('ExternalAccess', False)
+
+    v1 = client.CoreV1Api()
+    apps_v1 = client.AppsV1Api()
+    networking_v1 = client.NetworkingV1Api()
+
+    # Create Secret if any secrets are provided
+    if secrets:
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=f'{app_name}-secret'),
+            string_data=secrets
+        )
+        v1.create_namespaced_secret(namespace='default', body=secret)
+
+    # Prepare environment variables
+    env_vars = []
+    for env in envs:
+        env_name = re.sub(r'\s+', '_', env['Key']).upper()
+        env_value = env['Value']
+        env_vars.append(client.V1EnvVar(name=env_name, value=env_value))
+
+    # Create container with resources and environment variables
+    container = client.V1Container(
+        name=app_name,
+        image=f'{image_address}:{image_tag}',
+        ports=[client.V1ContainerPort(container_port=service_port)],
+        resources=client.V1ResourceRequirements(
+            limits={
+                'cpu': resources['CPU'],
+                'memory': resources['RAM']
+            }
+        ),
+        env=env_vars
+    )
+
+    if secrets:
+        container.env_from = [client.V1EnvFromSource(secret_ref=client.V1SecretEnvSource(name=f'{app_name}-secret'))]
+
+    # Create Deployment
+    template = client.V1PodTemplateSpec(
+        metadata=client.V1ObjectMeta(labels={"app": app_name}),
+        spec=client.V1PodSpec(containers=[container])
+    )
+
+    spec = client.V1DeploymentSpec(
+        replicas=replicas,
+        template=template,
+        selector={'matchLabels': {'app': app_name}}
+    )
+
+    deployment = client.V1Deployment(
+        api_version='apps/v1',
+        kind='Deployment',
+        metadata=client.V1ObjectMeta(name=app_name),
+        spec=spec
+    )
+
+    apps_v1.create_namespaced_deployment(namespace='default', body=deployment)
+
+    # Create Service
+    service = client.V1Service(
+        api_version='v1',
+        kind='Service',
+        metadata=client.V1ObjectMeta(name=app_name),
+        spec=client.V1ServiceSpec(
+            selector={'app': app_name},
+            ports=[client.V1ServicePort(port=service_port, target_port=service_port)]
+        )
+    )
+    try:
+        apps_v1.create_namespaced_deployment(namespace='default', body=deployment)
+    except client.rest.ApiException as e:
+        if e.status == 409:  # 409 status code indicates a conflict (resource already exists)
+            apps_v1.patch_namespaced_deployment(name=app_name, namespace='default', body=deployment)
+        else:
+            raise  # Re-raise the exception if it's not a conflict
+
+    # Create Ingress if external access is required
+    if external_access:
+        ingress = client.V1Ingress(
+            api_version='networking.k8s.io/v1',
+            kind='Ingress',
+            metadata=client.V1ObjectMeta(name=app_name),
+            spec=client.V1IngressSpec(
+                rules=[client.V1IngressRule(
+                    host=domain_address,
+                    http=client.V1HTTPIngressRuleValue(
+                        paths=[client.V1HTTPIngressPath(
+                            path='/',
+                            path_type='Prefix',
+                            backend=client.V1IngressBackend(
+                                service=client.V1IngressServiceBackend(
+                                    name=app_name,
+                                    port=client.V1ServiceBackendPort(number=service_port)
+                                )
+                            )
+                        )]
+                    )
+                )]
+            )
+        )
+        networking_v1.create_namespaced_ingress(namespace='default', body=ingress)
+
+    return jsonify({"message": "Application created successfully"}), 201
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
